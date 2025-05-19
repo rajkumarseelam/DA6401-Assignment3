@@ -16,7 +16,6 @@ class TransliterationDataset(Dataset):
         self.format = format
         
         if format == 'dakshina':
-            # Dakshina format: tab-separated without header
             for src, tgt in read_tsv(path):
                 src_ids = src_vocab.encode(src, add_sos=True, add_eos=True)
                 tgt_ids = tgt_vocab.encode(tgt, add_sos=True, add_eos=True)
@@ -41,7 +40,7 @@ def read_tsv(path):
         for ln in f:
             parts = ln.strip().split('\t')
             if len(parts) >= 2:
-                yield parts[1], parts[0]  # Dakshina format has target, source
+                yield parts[1], parts[0]  
 
 
 def read_csv(path, src_col='src', tgt_col='trg'):
