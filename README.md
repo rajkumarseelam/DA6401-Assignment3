@@ -100,6 +100,10 @@ Below are the command-line arguments supported by the script, specifying default
   **Type:** `str`  
   **Default:** `te`
 
+- `--base_dir`, `-br`  
+  **Description:** Base directory containing the dataset.  
+  **Type:** `str`  
+  **Default:** `/kaggle/input/dakshina_dataset_v1.0`  
 
 - `--output_dir`, `-od`  
   **Description:** Directory to save models and outputs.  
