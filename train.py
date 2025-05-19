@@ -15,7 +15,7 @@ if __name__ == "__main__":
     
     # Data parameters
     parser.add_argument("--language", "-l", type=str, default="te", help="Language code (e.g., 'te' for Telugu)")
-    parser.add_argument("--base_dir", "-br", type=str, default="/kaggle/input/dakshina_dataset_v1.0", help="Base directory containing the dataset")
+    parser.add_argument("--base_dir", "-br", type=str, default="/kaggle/working/dakshina_dataset_v1.0/te/lexicons", help="Base directory containing the dataset")
     parser.add_argument("--output_dir", "-od", type=str, default="./output", help="Directory to save models and outputs")
     
     # Model architecture
