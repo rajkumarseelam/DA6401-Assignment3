@@ -1,108 +1,125 @@
-
 import wandb
 import torch
 
-# Import enhanced modules
-from models import Encoder, Decoder, Seq2Seq, seed_everything
-from model_training import train_model
-from data_loader import get_dataloaders
 
-def objective():
-    # Initialize WandB run
+from models import SourceEncoder, TargetDecoder, Seq2SeqTransliterator, set_random_seeds
+from model_training import train_transliteration_model
+from data_loader import prepare_dataloaders
+
+def hyperparameter_search():
+    """Run hyperparameter search using Weights & Biases Sweep"""
+    # Initialize a new WandB run
     run = wandb.init()
     cfg = run.config
     
     # Set seeds for reproducibility
-    seed_everything(cfg.seed if hasattr(cfg, 'seed') else 42)
+    set_random_seeds(cfg.seed if hasattr(cfg, 'seed') else 42)
     
     # Set device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
     
-    # Create a unique run name based on config
-    run_name = f"{cfg.cell}_{cfg.enc_layers}l_{cfg.emb_size}e_{cfg.hidden_size}h_" \
-               f"{'bid' if cfg.bidirectional else 'uni'}_{cfg.dropout}d_" \
-               f"{cfg.teacher_forcing}tf_{cfg.optimizer}"
+    # Create a descriptive run name based on hyperparameters
+    run_name = (
+        f"{cfg.rnn_type}_{cfg.num_layers}L_{cfg.embedding_size}E_{cfg.hidden_size}H_"
+        f"{'Bi' if cfg.bidirectional else 'Uni'}_"
+        f"D{cfg.dropout}_TF{cfg.teacher_forcing}_{cfg.optimizer}"
+    )
     wandb.run.name = run_name
     
-    # Load data
-    # I have choosen telugu language
-    loaders, src_vocab, tgt_vocab = get_dataloaders(
-        'te',
+    # Load data with appropriate dataloaders
+    data_loaders, source_vocab, target_vocab = prepare_dataloaders(
+        language_code='te',  # Telugu language
         batch_size=cfg.batch_size,
-        device=device
+        device_type=device
     )
     
-    # Create model components
-    enc = Encoder(
-        src_vocab.size, cfg.emb_size, cfg.hidden_size,
-        cfg.enc_layers, cfg.cell, cfg.dropout, 
-        bidirectional=cfg.bidirectional
+    # Create encoder
+    encoder = SourceEncoder(
+        vocabulary_size=source_vocab.vocabulary_size,
+        embedding_dim=cfg.embedding_size,
+        hidden_dim=cfg.hidden_size,
+        num_layers=cfg.num_layers,
+        rnn_type=cfg.rnn_type,
+        dropout_rate=cfg.dropout,
+        use_bidirectional=cfg.bidirectional
     ).to(device)
     
     # Calculate encoder output dimension (doubled if bidirectional)
-    enc_out_dim = cfg.hidden_size * 2 if cfg.bidirectional else cfg.hidden_size
+    encoder_output_dim = cfg.hidden_size * 2 if cfg.bidirectional else cfg.hidden_size
     
-    #Currently attention is set to false , To enable just pass use_attn=True
-    dec = Decoder(
-        tgt_vocab.size, cfg.emb_size, enc_out_dim, cfg.hidden_size,
-        cfg.enc_layers, cfg.cell, cfg.dropout
-    ).to(device) #use_attn=True as last parameter.
+    # Create decoder (without attention for this search)
+    decoder = TargetDecoder(
+        vocabulary_size=target_vocab.vocabulary_size,
+        embedding_dim=cfg.embedding_size,
+        encoder_dim=encoder_output_dim,
+        decoder_dim=cfg.hidden_size,
+        num_layers=cfg.num_layers,
+        rnn_type=cfg.rnn_type,
+        dropout_rate=cfg.dropout,
+        enable_attention=False  # No attention for this search you can modify it to true..
+    ).to(device)
     
-    model = Seq2Seq(enc, dec, pad_idx=src_vocab.pad_idx, device=device).to(device)
+    # Create full seq2seq model
+    model = Seq2SeqTransliterator(
+        encoder=encoder,
+        decoder=decoder,
+        pad_token_idx=source_vocab.pad_index,
+        device_name=device
+    ).to(device)
     
     # Train the model
-    best_model_path = f"model_{run_name}.pt"
-    _, test_acc = train_model(
+    best_model_path = f"best_model_{run_name}.pt"
+    _, test_accuracy = train_transliteration_model(
         model=model,
-        loaders=loaders,
-        src_vocab=src_vocab,
-        tgt_vocab=tgt_vocab,
+        data_loaders=data_loaders,
+        source_vocab=source_vocab,
+        target_vocab=target_vocab,
         device=device,
         config=cfg,
-        save_path=best_model_path,
-        log_to_wandb=True
+        model_save_path=best_model_path,
+        enable_wandb_logging=True
     )
     
     # Log final test accuracy as summary metric
-    wandb.run.summary['test_accuracy'] = test_acc
+    wandb.run.summary['test_accuracy'] = test_accuracy * 100  # as percentage
     
     # Finish the run
     wandb.finish()
 
 if __name__ == "__main__":
-    sweep_cfg = {
-        
-        'method': 'bayes',  # Use Bayesian optimization
-        'name':'Transliteration_without_Attention',
-        'metric': {'name': 'val_acc', 'goal': 'maximize'},
+    # Define the hyperparameter search space
+    sweep_configuration = {
+        'method': 'bayes',  # Bayesian optimization for better search efficiency
+        'name': 'Transliteration_NoAttention_Sweep',
+        'metric': {'name': 'validation_accuracy', 'goal': 'maximize'},
         'parameters': {
-            
-            # Model architecture
-            'emb_size': {'values': [128, 256, 512]},
+            # Model architecture parameters
+            'embedding_size': {'values': [128, 256, 512]},
             'hidden_size': {'values': [128, 256, 512, 1024]},
-            'enc_layers': {'values': [1, 2, 3, 4]},
-            'cell': {'values': ['RNN', 'GRU', 'LSTM']},  
-            'bidirectional': {'values': [True, False]},  # Bidirectional encode
+            'num_layers': {'values': [1, 2, 3, 4]},
+            'rnn_type': {'values': ['RNN', 'GRU', 'LSTM']},
+            'bidirectional': {'values': [True, False]},
             
             # Training parameters
             'dropout': {'values': [0.0, 0.1, 0.2, 0.3, 0.5]},
-            'lr': {'values': [1e-4, 2e-4, 5e-4, 8e-4, 1e-3]},
+            'learning_rate': {'values': [1e-4, 2e-4, 5e-4, 8e-4, 1e-3]},
             'batch_size': {'values': [32, 64, 128]},
             'epochs': {'values': [10, 15, 20]},
-            'teacher_forcing': {'values': [0.3, 0.5, 0.7, 1.0]},  # Explicit teacher forcing
-            'optimizer': {'values': ['Adam', 'NAdam']},  # Added optimizer options
-            # Reproducibility
-            'seed': {'values': [42, 43, 44, 45, 46]},  # Different seeds for robustness
+            'teacher_forcing': {'values': [0.3, 0.5, 0.7, 1.0]},
+            'optimizer': {'values': ['Adam', 'NAdam']},
+            
+            # Reproducibility parameter
+            'seed': {'values': [42, 43, 44, 45, 46]},
         }
     }
 
-    # Start the sweep
+    # Initialize the hyperparameter sweep
     sweep_id = wandb.sweep(
-        sweep_cfg,
+        sweep_configuration,
         entity='cs24m042-iit-madras-foundation', 
         project='DA6401-Assignment-3'
     )
     
     # Run the sweep agent
-    wandb.agent(sweep_id, function=objective, count=1)
+    wandb.agent(sweep_id, function=hyperparameter_search, count=1)
