@@ -19,22 +19,22 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", "-od", type=str, default="./output", help="Directory to save models and outputs")
     
     # Model architecture
-    parser.add_argument("--emb_size", "-es", type=int, default=512, help="Embedding size")
-    parser.add_argument("--hidden_size", "-hs", type=int, default=256, help="Hidden state size")
-    parser.add_argument("--enc_layers", "-el", type=int, default=3, help="Number of encoder layers")
+    parser.add_argument("--emb_size", "-es", type=int, default=256, help="Embedding size")
+    parser.add_argument("--hidden_size", "-hs", type=int, default=1024, help="Hidden state size")
+    parser.add_argument("--enc_layers", "-el", type=int, default=1, help="Number of encoder layers")
     parser.add_argument("--cell_type", "-ct", type=str, default="GRU", choices=["RNN", "GRU", "LSTM"], help="RNN cell type")
-    parser.add_argument("--bidirectional", "-bi", action="store_false", help="Use bidirectional encoder")
-    parser.add_argument("--use_attention", "-att", type=str, default="false", choices=["true", "false"], help="Use attention mechanism")
+    parser.add_argument("--bidirectional", "-bi", action="store_true", help="Use bidirectional encoder")
+    parser.add_argument("--use_attention", "-att", type=str, default="True", choices=["true", "false"], help="Use attention mechanism")
     
     # Training parameters
     parser.add_argument("--batch_size", "-b", type=int, default=32, help="Batch size")
-    parser.add_argument("--epochs", "-e", type=int, default=15, help="Number of epochs")
-    parser.add_argument("--lr", "-lr", type=float, default=0.0005, help="Learning rate")
-    parser.add_argument("--dropout", "-dp", type=float, default=0.5, help="Dropout rate")
-    parser.add_argument("--teacher_forcing", "-tf", type=float, default=0.3, help="Teacher forcing ratio")
-    parser.add_argument("--optimizer", "-o", type=str, default="adam", choices=["adam", "nadam"], help="Optimizer")
+    parser.add_argument("--epochs", "-e", type=int, default=20, help="Number of epochs")
+    parser.add_argument("--lr", "-lr", type=float, default=0.0002, help="Learning rate")
+    parser.add_argument("--dropout", "-dp", type=float, default=0.2, help="Dropout rate")
+    parser.add_argument("--teacher_forcing", "-tf", type=float, default=0.5, help="Teacher forcing ratio")
+    parser.add_argument("--optimizer", "-o", type=str, default="nadam", choices=["adam", "nadam"], help="Optimizer")
     parser.add_argument("--weight_decay", "-wd", type=float, default=0.0001, help="Weight decay for optimizer")
-    parser.add_argument("--seed", "-s", type=int, default=44, help="Random seed")
+    parser.add_argument("--seed", "-s", type=int, default=46, help="Random seed")
     parser.add_argument("--device", "-d", type=str, default="cuda", choices=["cuda", "cpu"], help="Device to use")
     
     args = parser.parse_args()
