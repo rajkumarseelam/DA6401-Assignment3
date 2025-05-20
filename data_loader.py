@@ -1,137 +1,166 @@
-
 import os
 import torch
 import pickle
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import pandas as pd
-from vocab import CharVocab
+from typing import Dict, Tuple, List, Optional, Callable, Any, Iterator
 
-class TransliterationDataset(Dataset):
-    """A flexible dataset class that can handle  Dakshina  dataset"""
+
+def parse_transliteration_file(filepath: str) -> Iterator[Tuple[str, str]]:
+    with open(filepath, encoding='utf-8') as file:
+        for line in file:
+            items = line.strip().split('\t')
+            if len(items) >= 2:
+                # Return native and latin text in expected order
+                yield items[1], items[0]
+
+def parse_csv_file(filepath: str, source_col: str = 'src', target_col: str = 'trg') -> Iterator[Tuple[str, str]]:
+    dataframe = pd.read_csv(filepath)
+    for _, row in dataframe.iterrows():
+        yield row[source_col], row[target_col]
+
+class TransliterationCorpus(Dataset):
     
-    def __init__(self, path, src_vocab, tgt_vocab, format='dakshina'):
-       
-        self.examples = []
-        self.format = format
+    def __init__(self, filepath: str, source_vocab, target_vocab, filetype: str = 'tsv'):
         
-        if format == 'dakshina':
-            for src, tgt in read_tsv(path):
-                src_ids = src_vocab.encode(src, add_sos=True, add_eos=True)
-                tgt_ids = tgt_vocab.encode(tgt, add_sos=True, add_eos=True)
-                self.examples.append((
-                    torch.tensor(src_ids, dtype=torch.long),
-                    torch.tensor(tgt_ids, dtype=torch.long)
-                ))
+        self.samples = []
+        self.filetype = filetype
         
+        # Parse the data file based on format
+        if filetype == 'tsv':
+            parser = parse_transliteration_file
+        elif filetype == 'csv':
+            parser = parse_csv_file
         else:
-            raise ValueError(f"Unknown format: {format}. Use 'dakshina'")
+            raise ValueError(f"Unsupported file type: {filetype}. Use 'tsv' or 'csv'")
+        
+        # Process each source-target pair
+        for source_text, target_text in parser(filepath):
+            # Tokenize both source and target text with boundary tokens
+            source_indices = source_vocab.tokenize(source_text, add_start=True, add_end=True)
+            target_indices = target_vocab.tokenize(target_text, add_start=True, add_end=True)
+            
+            # Convert to tensors and store
+            self.samples.append((
+                torch.tensor(source_indices, dtype=torch.long),
+                torch.tensor(target_indices, dtype=torch.long)
+            ))
 
-    def __len__(self):
-        return len(self.examples)
+    def __len__(self) -> int:
+        """Get the number of samples in the dataset"""
+        return len(self.samples)
 
-    def __getitem__(self, idx):
-        return self.examples[idx]
-
-
-def read_tsv(path):
-    """Read a tab-separated file with source and target text"""
-    with open(path, encoding='utf-8') as f:
-        for ln in f:
-            parts = ln.strip().split('\t')
-            if len(parts) >= 2:
-                yield parts[1], parts[0]  
-
-
-def read_csv(path, src_col='src', tgt_col='trg'):
-    """Read a CSV file with source and target columns"""
-    df = pd.read_csv(path)
-    for _, row in df.iterrows():
-        yield row[src_col], row[tgt_col]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get a single sample by index"""
+        return self.samples[idx]
 
 
-def collate_fn(batch, src_vocab, tgt_vocab):
-    """Collate function to handle variable-length sequences"""
-    srcs, tgts = zip(*batch)
-    srcs_p = pad_sequence(srcs, batch_first=True, padding_value=src_vocab.pad_idx)
-    tgts_p = pad_sequence(tgts, batch_first=True, padding_value=tgt_vocab.pad_idx)
-    src_lens = torch.tensor([len(s) for s in srcs], dtype=torch.long)
-    return srcs_p, src_lens, tgts_p
-
-
-def get_dataloaders(
-        language='te', 
-        dataset_format='dakshina',
-        base_path=None,
-        batch_size=64,
-        device='cpu',
-        num_workers=2,
-        prefetch_factor=4,
-        persistent_workers=True,
-        cache_dir='./cache',
-        use_cached_vocab=True
-    ):
+def create_batch_tensors(batch_data, source_vocab, target_vocab) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     
-    # Set up paths based on dataset format
-    if base_path is None:
-        base_path = os.path.join(
+    # Separate sources and targets
+    sources, targets = zip(*batch_data)
+    
+    # Pad sequences to the same length
+    padded_sources = pad_sequence(sources, batch_first=True, padding_value=source_vocab.pad_index)
+    padded_targets = pad_sequence(targets, batch_first=True, padding_value=target_vocab.pad_index)
+    
+    # Calculate original lengths for packing
+    source_lengths = torch.tensor([len(s) for s in sources], dtype=torch.long)
+    
+    return padded_sources, source_lengths, padded_targets
+
+
+def prepare_dataloaders(
+        language_code: str = 'te',
+        format_type: str = 'tsv',
+        data_root: Optional[str] = None,
+        batch_size: int = 64,
+        device_type: str = 'cpu',
+        worker_count: int = 2,
+        prefetch_multiplier: int = 4,
+        keep_workers_alive: bool = True,
+        vocabulary_cache_dir: str = './vocab_cache',
+        use_cached_vocabulary: bool = True
+    ) -> Tuple[Dict[str, DataLoader], Any, Any]:
+   
+    # Set up the data directory
+    if data_root is None:
+        data_root = os.path.join(
             '/kaggle/working/dakshina_dataset_v1.0',
-            language, 'lexicons'
+            language_code, 'lexicons'
         )
-
-    # Create cache directory if it doesn't exist
-    if use_cached_vocab:
-        os.makedirs(cache_dir, exist_ok=True)
-        vocab_cache_path = os.path.join(cache_dir, f"{language}_{dataset_format}_vocab.pkl")
     
-    # Try to load cached vocabularies
-    if use_cached_vocab and os.path.exists(vocab_cache_path):
-        print(f"Loading cached vocabularies from {vocab_cache_path}")
+    # Prepare vocabulary cache
+    if use_cached_vocabulary:
+        os.makedirs(vocabulary_cache_dir, exist_ok=True)
+        vocab_cache_path = os.path.join(
+            vocabulary_cache_dir, 
+            f"{language_code}_{format_type}_vocabulary.pkl"
+        )
+    
+    # Load or build vocabularies
+    if use_cached_vocabulary and os.path.exists(vocab_cache_path):
+        print(f"Loading vocabularies from cache: {vocab_cache_path}")
         with open(vocab_cache_path, 'rb') as f:
-            src_vocab, tgt_vocab = pickle.load(f)
+            source_vocab, target_vocab = pickle.load(f)
     else:
-        # Build vocabularies from data
-        all_src, all_tgt = [], []
+        # Build vocabularies from training and validation data
+        all_source_texts, all_target_texts = [], []
         
         for split in ['train', 'dev']:
-            path = os.path.join(base_path, f"{language}.translit.sampled.{split}.tsv")
-            for s, t in read_tsv(path):
-                all_src.append(s)
-                all_tgt.append(t)
+            filepath = os.path.join(data_root, f"{language_code}.translit.sampled.{split}.tsv")
+            for src_text, tgt_text in parse_transliteration_file(filepath):
+                all_source_texts.append(src_text)
+                all_target_texts.append(tgt_text)
         
+        # Create vocabularies from the collected texts
+        from vocab import SequenceVocabulary
+        source_vocab = SequenceVocabulary.create_from_corpus(all_source_texts)
+        target_vocab = SequenceVocabulary.create_from_corpus(all_target_texts)
         
-        # Build vocabularies
-        src_vocab = CharVocab.build_from_texts(all_src)
-        tgt_vocab = CharVocab.build_from_texts(all_tgt)
-        
-        # Cache vocabularies
-        if use_cached_vocab:
+        # Cache vocabularies if requested
+        if use_cached_vocabulary:
             with open(vocab_cache_path, 'wb') as f:
-                pickle.dump((src_vocab, tgt_vocab), f)
+                pickle.dump((source_vocab, target_vocab), f)
     
-    # Common DataLoader arguments
-    loader_kwargs = dict(
-        batch_size=batch_size,
-        num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=persistent_workers and num_workers > 0,
-        pin_memory=(device == 'cuda')
-    )
+    # Common DataLoader settings
+    loader_settings = {
+        'batch_size': batch_size,
+        'num_workers': worker_count,
+        'prefetch_factor': prefetch_multiplier,
+        'persistent_workers': keep_workers_alive and worker_count > 0,
+        'pin_memory': device_type == 'cuda'
+    }
     
     # Create data loaders for each split
-    loaders = {}
+    data_loaders = {}
     
+    # Define the splits and their corresponding file names
+    split_mapping = {
+        'train': 'train', 
+        'validation': 'dev', 
+        'test': 'test'
+    }
     
-    splits = {'train': 'train', 'dev': 'dev', 'test': 'test'}
-    for split_name, file_split in splits.items():
-        path = os.path.join(base_path, f"{language}.translit.sampled.{file_split}.tsv")
-        ds = TransliterationDataset(path, src_vocab, tgt_vocab, format='dakshina')
-        loaders[split_name] = DataLoader(
-            ds,
-            shuffle=(split_name == 'train'),
-            collate_fn=lambda b: collate_fn(b, src_vocab, tgt_vocab),
-            **loader_kwargs
+    # Create a data loader for each split
+    for loader_name, file_suffix in split_mapping.items():
+        filepath = os.path.join(data_root, f"{language_code}.translit.sampled.{file_suffix}.tsv")
+        
+        # Create the dataset
+        dataset = TransliterationCorpus(
+            filepath, 
+            source_vocab, 
+            target_vocab, 
+            filetype=format_type
+        )
+        
+        # Create the data loader with appropriate settings
+        data_loaders[loader_name] = DataLoader(
+            dataset,
+            shuffle=(loader_name == 'train'),  # Only shuffle training data
+            collate_fn=lambda b: create_batch_tensors(b, source_vocab, target_vocab),
+            **loader_settings
         )
     
-    
-    return loaders, src_vocab, tgt_vocab
+    return data_loaders, source_vocab, target_vocab
