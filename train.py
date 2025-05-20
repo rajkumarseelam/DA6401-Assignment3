@@ -1,6 +1,6 @@
-from models import Encoder, Decoder, Seq2Seq, seed_everything
-from data_loader import get_dataloaders
-from model_training import train_model, compute_detailed_accuracy, save_predictions_to_csv
+from models import SourceEncoder, TargetDecoder, Seq2SeqTransliterator, set_random_seeds
+from data_loader import prepare_dataloaders
+from model_training import train_transliteration_model, evaluate_model_accuracy, save_results_to_csv
 import argparse
 import wandb
 import torch
@@ -8,7 +8,6 @@ from pathlib import Path
 import types
 
 if __name__ == "__main__":
-    # Added the default parameters of my best config
     parser = argparse.ArgumentParser(description="Train a seq2seq transliteration model")
     parser.add_argument("--wandb_entity", "-we", help="Wandb Entity", default="cs24m042-iit-madras-foundation")
     parser.add_argument("--wandb_project", "-wp", help="Project name", default="DA6401-Assignment-3")
@@ -37,29 +36,44 @@ if __name__ == "__main__":
     parser.add_argument("--seed", "-s", type=int, default=46, help="Random seed")
     parser.add_argument("--device", "-d", type=str, default="cuda", choices=["cuda", "cpu"], help="Device to use")
     
+    
+    # Parse arguments
     args = parser.parse_args()
     
-    # Convert args to config object expected by train_model function
-    config = types.SimpleNamespace(**vars(args))
+    # Convert arguments to config namespace
+    config = types.SimpleNamespace(
+        lr=args.lr,
+        epochs=args.epochs,
+        teacher_forcing=args.teacher_forcing,
+        optimizer=args.optimizer,
+        batch_size=args.batch_size,
+        dropout=args.dropout,
+        seed=args.seed
+    )
     
-    # Set up paths
+    # Create output directory
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True, parents=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Set seeds for reproducibility
-    seed_everything(args.seed)
+    # Set random seeds for reproducibility
+    set_random_seeds(args.seed)
     
     # Set device
-    device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
+    device = torch.device(
+        args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu'
+    )
     print(f"Using device: {device}")
     
-    # Convert string arguments to boolean
-    use_attention = (args.use_attention == "true")
+    # Parse boolean arguments
+    use_attention = (args.use_attention.lower() == "true")
     
     # Create a descriptive run name
-    run_name = f"{args.language}_{args.cell_type}_{args.enc_layers}l_{args.emb_size}emb_{args.hidden_size}hid_" \
-               f"{'bid' if args.bidirectional else 'uni'}_{'attn' if use_attention else 'plain'}_" \
-               f"{args.optimizer}_lr{args.lr}_tf{args.teacher_forcing}"
+    run_name = (
+        f"{args.language}_{args.cell_type}_{args.enc_layers}L_{args.emb_size}E_{args.hidden_size}H_"
+        f"{'Bidirectional' if args.bidirectional else 'Unidirectional'}_"
+        f"{'Attention' if use_attention else 'NoAttention'}_"
+        f"{args.optimizer}_LR{args.lr}_TF{args.teacher_forcing}"
+    )
     
     # Initialize wandb
     wandb.init(
@@ -71,57 +85,78 @@ if __name__ == "__main__":
     
     # Load datasets
     print(f"Loading {args.language} data...")
-    loaders, src_vocab, tgt_vocab = get_dataloaders(
-        language=args.language,
+    data_loaders, source_vocab, target_vocab = prepare_dataloaders(
+        language_code=args.language,
+        data_root=args.base_dir,
         batch_size=args.batch_size,
-        base_path=args.base_dir,
-        device=device.type
+        device_type=device.type
     )
     
-    # Print vocabulary stats
-    print(f"Source vocabulary size: {src_vocab.size}")
-    print(f"Target vocabulary size: {tgt_vocab.size}")
-    print(f"Training examples: {len(loaders['train'].dataset)}")
-    print(f"Validation examples: {len(loaders['dev'].dataset)}")
-    print(f"Test examples: {len(loaders['test'].dataset)}")
+    # Print vocabulary statistics
+    print(f"Source vocabulary size: {source_vocab.vocabulary_size}")
+    print(f"Target vocabulary size: {target_vocab.vocabulary_size}")
+    print(f"Training examples: {len(data_loaders['train'].dataset)}")
+    print(f"Validation examples: {len(data_loaders['validation'].dataset)}")
+    print(f"Test examples: {len(data_loaders['test'].dataset)}")
     
-    # Create model
-    print("Building model...")
+    # Create model components
+    print("Building model architecture...")
     
     # Create encoder
-    encoder = Encoder(
-        src_vocab.size, args.emb_size, args.hidden_size,
-        args.enc_layers, args.cell_type, args.dropout, 
-        bidirectional=args.bidirectional
+    encoder = SourceEncoder(
+        vocabulary_size=source_vocab.vocabulary_size,
+        embedding_dim=args.emb_size,
+        hidden_dim=args.hidden_size,
+        num_layers=args.enc_layers,
+        rnn_type=args.cell_type,
+        dropout_rate=args.dropout,
+        use_bidirectional=args.bidirectional
     ).to(device)
     
-    # Calculate encoder output dimension (doubled if bidirectional)
-    enc_out_dim = args.hidden_size * 2 if args.bidirectional else args.hidden_size
+    # Calculate encoder output dimension
+    encoder_output_dim = args.hidden_size * 2 if args.bidirectional else args.hidden_size
     
     # Create decoder
-    decoder = Decoder(
-        tgt_vocab.size, args.emb_size, enc_out_dim, args.hidden_size,
-        args.enc_layers, args.cell_type, args.dropout, 
-        use_attn=use_attention
+    decoder = TargetDecoder(
+        vocabulary_size=target_vocab.vocabulary_size,
+        embedding_dim=args.emb_size,
+        encoder_dim=encoder_output_dim,
+        decoder_dim=args.hidden_size,
+        num_layers=args.enc_layers,
+        rnn_type=args.cell_type,
+        dropout_rate=args.dropout,
+        enable_attention=use_attention
     ).to(device)
     
     # Create sequence-to-sequence model
-    model = Seq2Seq(encoder, decoder, pad_idx=src_vocab.pad_idx, device=device).to(device)
+    model = Seq2SeqTransliterator(
+        encoder=encoder,
+        decoder=decoder,
+        pad_token_idx=source_vocab.pad_index,
+        device_name=device
+    ).to(device)
+    
+    # Print model structure summary
+    print("Model architecture:")
+    print(f"  Encoder: {args.cell_type}, {'Bidirectional' if args.bidirectional else 'Unidirectional'}, "
+          f"{args.enc_layers} layers, {args.hidden_size} hidden units")
+    print(f"  Decoder: {args.cell_type}, {'With' if use_attention else 'Without'} attention, "
+          f"{args.enc_layers} layers, {args.hidden_size} hidden units")
     
     # Define model save path
     best_model_path = output_dir / f"{run_name}_best.pt"
     
-    # Train the model using the existing train_model function
-    print("Training model...")
-    model, test_acc = train_model(
+    # Train the model
+    print("Starting model training...")
+    model, test_accuracy = train_transliteration_model(
         model=model,
-        loaders=loaders,
-        src_vocab=src_vocab,
-        tgt_vocab=tgt_vocab,
+        data_loaders=data_loaders,
+        source_vocab=source_vocab,
+        target_vocab=target_vocab,
         device=device,
         config=config,
-        save_path=best_model_path,
-        log_to_wandb=True
+        model_save_path=best_model_path,
+        enable_wandb_logging=True
     )
     
     # Save final model
@@ -131,8 +166,14 @@ if __name__ == "__main__":
     
     # Generate final predictions
     print("Generating final predictions on test set...")
-    test_results = compute_detailed_accuracy(model, loaders['test'], tgt_vocab, src_vocab, device)
-    test_acc = test_results[0]
+    test_results = evaluate_model_accuracy(
+        model, 
+        data_loaders['test'], 
+        target_vocab, 
+        source_vocab, 
+        device
+    )
+    test_accuracy = test_results[0]
     
     correct_data = test_results[1]
     incorrect_data = test_results[2]
@@ -141,37 +182,42 @@ if __name__ == "__main__":
     correct_csv = output_dir / f"{run_name}_correct.csv"
     incorrect_csv = output_dir / f"{run_name}_incorrect.csv"
     
-    save_predictions_to_csv(
-        correct_data[0], correct_data[1], correct_data[2],
+    save_results_to_csv(
+        correct_data[0], 
+        correct_data[1], 
+        correct_data[2],
         correct_csv
     )
     
-    save_predictions_to_csv(
-        incorrect_data[0], incorrect_data[1], incorrect_data[2],
+    save_results_to_csv(
+        incorrect_data[0], 
+        incorrect_data[1], 
+        incorrect_data[2],
         incorrect_csv
     )
     
     # Log final results
-    print(f"Final test accuracy: {test_acc:.4f}")
+    print(f"Final test accuracy: {test_accuracy:.4f}")
     print(f"Saved correct predictions to {correct_csv}")
     print(f"Saved incorrect predictions to {incorrect_csv}")
     
-    # Create wandb tables for predictions if desired
+    # Create and log WandB tables for predictions
     try:
         # Log correct predictions
         correct_table = wandb.Table(
-            columns=["Source", "Target", "Predicted"],
+            columns=["Source", "Target", "Prediction"],
             data=list(zip(correct_data[0], correct_data[1], correct_data[2]))
         )
-        wandb.log({"Attention_Correct": correct_table})
+        wandb.log({"Correct_Predictions": correct_table})
         
         # Log incorrect predictions
         incorrect_table = wandb.Table(
-            columns=["Source", "Target", "Predicted"],
+            columns=["Source", "Target", "Prediction"],
             data=list(zip(incorrect_data[0], incorrect_data[1], incorrect_data[2]))
         )
-        wandb.log({"Attention_Incorrect": incorrect_table})
-    except:
-        print("Warning: Could not create wandb tables")
+        wandb.log({"Incorrect_Predictions": incorrect_table})
+    except Exception as e:
+        print(f"Warning: Could not create WandB tables: {e}")
     
+    # Finish WandB logging
     wandb.finish()
