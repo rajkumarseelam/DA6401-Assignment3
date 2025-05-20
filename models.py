@@ -2,189 +2,363 @@ import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import random
+from typing import Dict, Tuple, List, Optional, Union, Any, Callable
 
-# For reproducibility
-def seed_everything(seed=42):
-    """Set random seed for all major libraries"""
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+def set_random_seeds(seed_value: int = 42) -> None:
+    """Set random seeds for all libraries to ensure reproducibility"""
+    random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-class Encoder(nn.Module):
-    def __init__(self, vocab_size, emb_size, hid_size, layers=1, cell='LSTM', dropout=0.0, bidirectional=False):
+class SourceEncoder(nn.Module):
+    """Encoder module for sequence-to-sequence transliteration models"""
+    
+    def __init__(self, 
+                 vocabulary_size: int, 
+                 embedding_dim: int, 
+                 hidden_dim: int, 
+                 num_layers: int = 1,
+                 rnn_type: str = 'LSTM', 
+                 dropout_rate: float = 0.0,
+                 use_bidirectional: bool = False):
+        
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, emb_size)
-        self.bidirectional = bidirectional
-        self.cell_type = cell
-        self.layers = layers
-        self.hidden_size = hid_size
         
-        # Output size will be doubled if bidirectional
-        self.output_size = hid_size * 2 if bidirectional else hid_size
+        # Character embedding layer
+        self.char_embeddings = nn.Embedding(vocabulary_size, embedding_dim)
         
-        rnn_cls = {'LSTM': nn.LSTM, 'GRU': nn.GRU, 'RNN': nn.RNN}[cell]
-        self.rnn = rnn_cls(emb_size,
-                         hid_size,
-                         num_layers=layers,
-                         dropout=dropout if layers>1 else 0.0,
-                         batch_first=True,
-                         bidirectional=bidirectional)
+        # Configuration
+        self.use_bidirectional = use_bidirectional
+        self.rnn_type = rnn_type
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        
+        # Calculate output dimensions
+        self.output_dim = hidden_dim * 2 if use_bidirectional else hidden_dim
+        
+        # Select RNN type
+        rnn_classes = {
+            'LSTM': nn.LSTM, 
+            'GRU': nn.GRU, 
+            'RNN': nn.RNN
+        }
+        
+        if rnn_type not in rnn_classes:
+            raise ValueError(f"Unsupported RNN type: {rnn_type}. Use 'LSTM', 'GRU', or 'RNN'")
+        
+        rnn_class = rnn_classes[rnn_type]
+        
+        # Create the RNN
+        self.sequence_encoder = rnn_class(
+            input_size=embedding_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout_rate if num_layers > 1 else 0.0,
+            batch_first=True,
+            bidirectional=use_bidirectional
+        )
 
-    def forward(self, src, lengths):
-        # src: [B, T], lengths: [B]
-        embedded = self.embedding(src)  # [B, T, E]
-        packed = pack_padded_sequence(embedded, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        packed_out, hidden = self.rnn(packed)
-        outputs, _ = pad_packed_sequence(packed_out, batch_first=True)  # [B, T, H*dirs]
+    def forward(self, source_tokens: torch.Tensor, 
+                token_lengths: torch.Tensor) -> Tuple[torch.Tensor, Any]:
         
-        # If bidirectional, we need to process hidden state properly
-        if self.bidirectional:
-            if self.cell_type == 'LSTM':
-                # For LSTM we have both hidden and cell states
-                h_n, c_n = hidden
-                # Combine forward and backward states by averaging
-                h_n = torch.add(h_n[0:self.layers], h_n[self.layers:]) / 2
-                c_n = torch.add(c_n[0:self.layers], c_n[self.layers:]) / 2
-                hidden = (h_n, c_n)
-            else:
-                # For GRU/RNN we only have hidden state
-                hidden = torch.add(hidden[0:self.layers], hidden[self.layers:]) / 2
+        # Get character embeddings
+        embedded = self.char_embeddings(source_tokens)  # [B, T, E]
+        
+        # Pack sequences for efficiency
+        packed_input = pack_padded_sequence(
+            embedded, 
+            token_lengths.cpu(), 
+            batch_first=True, 
+            enforce_sorted=False
+        )
+        
+        # Process through RNN
+        packed_output, final_states = self.sequence_encoder(packed_input)
+        
+        # Unpack sequences
+        encoded_sequences, _ = pad_packed_sequence(
+            packed_output, 
+            batch_first=True
+        )  # [B, T, H*dirs]
+        
+        # Process final states for bidirectional models
+        if self.use_bidirectional:
+            if self.rnn_type == 'LSTM':
+                # For LSTM we have hidden and cell states
+                hidden_states, cell_states = final_states
                 
-        return outputs, hidden
-
-
-class BahdanauAttention(nn.Module):
-    def __init__(self, enc_hid, dec_hid):
-        super().__init__()
-        self.attn = nn.Linear(enc_hid + dec_hid, dec_hid)
-        self.v = nn.Linear(dec_hid, 1, bias=False)
-
-    def forward(self, hidden, encoder_outputs, mask):
-        # hidden: [B, H], encoder_outputs: [B, T, H], mask: [B, T]
-        B, T, H = encoder_outputs.size()
-        hidden = hidden.unsqueeze(1).repeat(1, T, 1)               # [B, T, H]
-        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))  # [B, T, H]
-        scores = self.v(energy).squeeze(2)                        # [B, T]
-        scores = scores.masked_fill(~mask, -1e9)
-        return torch.softmax(scores, dim=1)                       # [B, T]
-
-
-class Decoder(nn.Module):
-    """
-    One class, two modes:
-        • use_attn=True  – Bahdanau attention (default)
-        • use_attn=False – Plain RNN decoder (no attention)
-
-    Forward always returns (logits, hidden, attn_weights_or_None),
-    so Seq2Seq code stays unchanged.
-    """
-    def __init__(self, vocab_size, emb_size, enc_hid, dec_hid,
-                 layers=1, cell="LSTM", dropout=0.0, use_attn=False):
-        super().__init__()
-        self.use_attn = use_attn
-        self.embedding = nn.Embedding(vocab_size, emb_size)
-        self.cell_type = cell
-
-        # ----- dimensions depend on whether we concatenate context -----
-        if use_attn:
-            self.attention = BahdanauAttention(enc_hid, dec_hid)
-            rnn_input_dim = emb_size + enc_hid            # [E ⊕ Henc]
-            fc_input_dim  = dec_hid + enc_hid + emb_size  # [Hdec ⊕ Henc ⊕ E]
-        else:
-            rnn_input_dim = emb_size
-            fc_input_dim  = dec_hid + emb_size
-
-        rnn_cls = {"LSTM": nn.LSTM, "GRU": nn.GRU, "RNN": nn.RNN}[cell]
-        self.rnn = rnn_cls(rnn_input_dim, dec_hid,
-                           num_layers=layers,
-                           dropout=dropout if layers > 1 else 0.0,
-                           batch_first=True)
-        self.fc = nn.Linear(fc_input_dim, vocab_size)
-
-    def forward(self, input_token, hidden, encoder_outputs, mask):
-        """
-        input_token : [B]
-        hidden      : tuple|tensor  initial state for this step
-        encoder_outputs : [B, Tenc, Henc]
-        mask        : [B, Tenc]  (ignored when use_attn=False)
-        """
-        emb = self.embedding(input_token).unsqueeze(1)     # [B,1,E]
-
-        if self.use_attn:
-            # ---- additive attention ----
-            if self.cell_type == 'LSTM':
-                dec_h = hidden[0][-1]
-            else:
-                dec_h = hidden[-1]
+                # Combine forward/backward by averaging
+                fwd_hidden = hidden_states[0:self.num_layers]
+                bwd_hidden = hidden_states[self.num_layers:]
+                merged_hidden = (fwd_hidden + bwd_hidden) / 2
                 
-            attn_w = self.attention(dec_h, encoder_outputs, mask)          # [B,Tenc]
-            ctx    = torch.bmm(attn_w.unsqueeze(1), encoder_outputs)        # [B,1,Henc]
-            rnn_in = torch.cat((emb, ctx), dim=2)                           # [B,1,E+Henc]
+                fwd_cell = cell_states[0:self.num_layers]
+                bwd_cell = cell_states[self.num_layers:]
+                merged_cell = (fwd_cell + bwd_cell) / 2
+                
+                final_states = (merged_hidden, merged_cell)
+            else:
+                # For GRU/RNN we only have hidden states
+                fwd_hidden = final_states[0:self.num_layers]
+                bwd_hidden = final_states[self.num_layers:]
+                final_states = (fwd_hidden + bwd_hidden) / 2
+                
+        return encoded_sequences, final_states
+
+
+class AttentionMechanism(nn.Module):
+    """Neural attention mechanism for focusing on relevant encoder states"""
+    
+    def __init__(self, encoder_dim: int, decoder_dim: int):
+        
+        super().__init__()
+        
+        # Layers for attention computation
+        self.attention_transform = nn.Linear(encoder_dim + decoder_dim, decoder_dim)
+        self.attention_scorer = nn.Linear(decoder_dim, 1, bias=False)
+
+    def forward(self, decoder_state: torch.Tensor, 
+                encoder_outputs: torch.Tensor,
+                input_mask: torch.Tensor) -> torch.Tensor:
+       
+        # Get dimensions
+        batch_size, seq_len, _ = encoder_outputs.size()
+        
+        # Expand decoder state to match encoder outputs
+        expanded_state = decoder_state.unsqueeze(1).repeat(1, seq_len, 1)
+        
+        # Compute attention scores
+        concat_states = torch.cat((expanded_state, encoder_outputs), dim=2)
+        attention_features = torch.tanh(self.attention_transform(concat_states))
+        attention_scores = self.attention_scorer(attention_features).squeeze(2)
+        
+        # Apply mask to ignore padding tokens
+        attention_scores = attention_scores.masked_fill(~input_mask, -1e9)
+        
+        # Apply softmax to get attention weights
+        return torch.softmax(attention_scores, dim=1)
+
+
+class TargetDecoder(nn.Module):
+    """Decoder for generating target sequences with optional attention"""
+    
+    def __init__(self, 
+                 vocabulary_size: int, 
+                 embedding_dim: int,
+                 encoder_dim: int, 
+                 decoder_dim: int,
+                 num_layers: int = 1, 
+                 rnn_type: str = 'LSTM', 
+                 dropout_rate: float = 0.0,
+                 enable_attention: bool = True):
+       
+        super().__init__()
+        
+        # Configuration
+        self.enable_attention = enable_attention
+        self.rnn_type = rnn_type
+        
+        # Character embedding layer
+        self.char_embeddings = nn.Embedding(vocabulary_size, embedding_dim)
+        
+        # Attention mechanism
+        if enable_attention:
+            self.attention = AttentionMechanism(encoder_dim, decoder_dim)
+            rnn_input_dim = embedding_dim + encoder_dim
+            projection_input_dim = decoder_dim + encoder_dim + embedding_dim
         else:
-            ctx = None
-            attn_w = None
-            rnn_in = emb                                                    # [B,1,E]
+            rnn_input_dim = embedding_dim
+            projection_input_dim = decoder_dim + embedding_dim
+        
+        # Select RNN type
+        rnn_classes = {
+            'LSTM': nn.LSTM, 
+            'GRU': nn.GRU, 
+            'RNN': nn.RNN
+        }
+        
+        if rnn_type not in rnn_classes:
+            raise ValueError(f"Unsupported RNN type: {rnn_type}. Use 'LSTM', 'GRU', or 'RNN'")
+        
+        rnn_class = rnn_classes[rnn_type]
+        
+        # Create the RNN
+        self.sequence_decoder = rnn_class(
+            input_size=rnn_input_dim,
+            hidden_size=decoder_dim,
+            num_layers=num_layers,
+            dropout=dropout_rate if num_layers > 1 else 0.0,
+            batch_first=True
+        )
+        
+        # Output projection layer
+        self.output_projection = nn.Linear(projection_input_dim, vocabulary_size)
 
-        out, hidden = self.rnn(rnn_in, hidden)       # [B,1,Hdec]
-        out = out.squeeze(1)                         # [B,Hdec]
-        emb = emb.squeeze(1)                         # [B,E]
-
-        if self.use_attn:
-            ctx = ctx.squeeze(1)                     # [B,Henc]
-            logits = self.fc(torch.cat((out, ctx, emb), dim=1))
+    def forward(self, 
+                token: torch.Tensor,
+                hidden_state: Any,
+                encoder_outputs: torch.Tensor,
+                attention_mask: torch.Tensor) -> Tuple[torch.Tensor, Any, Optional[torch.Tensor]]:
+        
+        # Get character embeddings for current token
+        embedded = self.char_embeddings(token).unsqueeze(1)  # [B, 1, E]
+        
+        # Apply attention if enabled
+        if self.enable_attention:
+            # Extract the top layer hidden state for attention
+            if self.rnn_type == 'LSTM':
+                # For LSTM, hidden state is a tuple (h_n, c_n)
+                top_hidden = hidden_state[0][-1]
+            else:
+                # For GRU/RNN, hidden state is just h_n
+                top_hidden = hidden_state[-1]
+            
+            # Compute attention weights
+            attention_weights = self.attention(top_hidden, encoder_outputs, attention_mask)  # [B, T]
+            
+            # Create context vector using attention weights
+            context = torch.bmm(
+                attention_weights.unsqueeze(1),  # [B, 1, T]
+                encoder_outputs                  # [B, T, H]
+            )  # [B, 1, H]
+            
+            # Concatenate embedding and context for RNN input
+            rnn_input = torch.cat((embedded, context), dim=2)  # [B, 1, E+H]
         else:
-            logits = self.fc(torch.cat((out, emb), dim=1))
+            context = None
+            attention_weights = None
+            rnn_input = embedded  # [B, 1, E]
+        
+        # Process through RNN
+        output, new_hidden = self.sequence_decoder(rnn_input, hidden_state)
+        output = output.squeeze(1)  # [B, H]
+        
+        # Prepare inputs for final projection
+        if self.enable_attention:
+            context = context.squeeze(1)  # [B, H]
+            embedded = embedded.squeeze(1)  # [B, E]
+            projection_input = torch.cat((output, context, embedded), dim=1)  # [B, H+H+E]
+        else:
+            embedded = embedded.squeeze(1)  # [B, E]
+            projection_input = torch.cat((output, embedded), dim=1)  # [B, H+E]
+        
+        # Project to vocabulary size
+        logits = self.output_projection(projection_input)  # [B, V]
+        
+        return logits, new_hidden, attention_weights
 
-        return logits, hidden, attn_w
 
-
-class Seq2Seq(nn.Module):
-    def __init__(self, encoder, decoder, pad_idx, device='cpu'):
+class Seq2SeqTransliterator(nn.Module):
+    """Complete sequence-to-sequence model for transliteration"""
+    
+    def __init__(self, encoder: SourceEncoder, decoder: TargetDecoder, 
+                 pad_token_idx: int, device_name: str = 'cpu'):
+        
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.pad_idx = pad_idx
-        self.device = device
+        self.pad_token_idx = pad_token_idx
+        self.device = device_name
 
-    def forward(self, src, src_lens, tgt, teacher_forcing_ratio=0.5):
-        """
-        Enhanced forward with explicit teacher forcing ratio control
-        """
-        enc_out, hidden = self.encoder(src, src_lens)
-        mask = (src != self.pad_idx)
-        B, T = tgt.size()
-        outputs = torch.zeros(B, T-1, self.decoder.fc.out_features, device=self.device)
-        input_tok = tgt[:, 0]  # <sos>
+    def forward(self, 
+                source: torch.Tensor, 
+                source_lengths: torch.Tensor,
+                target: torch.Tensor, 
+                teacher_forcing_ratio: float = 0.5) -> torch.Tensor:
         
-        for t in range(1, T):
-            out, hidden, _ = self.decoder(input_tok, hidden, enc_out, mask)
-            outputs[:, t-1] = out
+        # Encode source sequences
+        encoder_outputs, hidden_state = self.encoder(source, source_lengths)
+        
+        # Create mask for attention
+        attention_mask = (source != self.pad_token_idx)
+        
+        # Get batch size and sequence length
+        batch_size, target_len = target.size()
+        
+        # Initialize outputs tensor
+        outputs = torch.zeros(
+            batch_size, 
+            target_len - 1, 
+            self.decoder.output_projection.out_features, 
+            device=self.device
+        )
+        
+        # Start with first token (SOS)
+        current_token = target[:, 0]
+        
+        # Process sequence one token at a time
+        for t in range(1, target_len):
+            # Get output for current step
+            step_output, hidden_state, _ = self.decoder(
+                current_token, 
+                hidden_state, 
+                encoder_outputs, 
+                attention_mask
+            )
             
-            # Teacher forcing: with probability, use ground truth as next input
-            # Otherwise use predicted token
-            teacher_force = random.random() < teacher_forcing_ratio
-            if teacher_force:
-                input_tok = tgt[:, t]
+            # Store output
+            outputs[:, t-1] = step_output
+            
+            # Decide whether to use teacher forcing for next input
+            use_teacher_forcing = random.random() < teacher_forcing_ratio
+            
+            if use_teacher_forcing:
+                # Use actual target token as next input
+                current_token = target[:, t]
             else:
-                input_tok = out.argmax(1)
+                # Use predicted token as next input
+                current_token = step_output.argmax(1)
                 
         return outputs
 
-    def infer_greedy(self, src, src_lens, tgt_vocab, max_len=50):
-        enc_out, hidden = self.encoder(src, src_lens)
-        mask = (src != self.pad_idx)
-        B = src.size(0)
-        input_tok = torch.full((B,), tgt_vocab.sos_idx, device=self.device, dtype=torch.long)
-        generated = []
+    def generate_greedy(self, 
+                         source: torch.Tensor, 
+                         source_lengths: torch.Tensor,
+                         target_vocab: Any, 
+                         max_length: int = 50) -> torch.Tensor:
         
-        for _ in range(max_len):
-            out, hidden, _ = self.decoder(input_tok, hidden, enc_out, mask)
-            input_tok = out.argmax(1)
-            generated.append(input_tok.unsqueeze(1))
-            if (input_tok == tgt_vocab.eos_idx).all():
+        # Encode source sequences
+        encoder_outputs, hidden_state = self.encoder(source, source_lengths)
+        
+        # Create mask for attention
+        attention_mask = (source != self.pad_token_idx)
+        
+        # Get batch size
+        batch_size = source.size(0)
+        
+        # Start with start-of-sequence token
+        current_token = torch.full(
+            (batch_size,), 
+            target_vocab.start_index, 
+            device=self.device, 
+            dtype=torch.long
+        )
+        
+        # Store generated tokens
+        generated_tokens = []
+        
+        # Generate sequence token by token
+        for _ in range(max_length):
+            # Get output for current step
+            step_output, hidden_state, _ = self.decoder(
+                current_token, 
+                hidden_state, 
+                encoder_outputs, 
+                attention_mask
+            )
+            
+            # Get most likely token
+            current_token = step_output.argmax(1)
+            
+            # Add to generated sequence
+            generated_tokens.append(current_token.unsqueeze(1))
+            
+            # Stop if all sequences have end token
+            if (current_token == target_vocab.end_index).all():
                 break
                 
-        return torch.cat(generated, dim=1)
+        # Concatenate all tokens
+        return torch.cat(generated_tokens, dim=1)
