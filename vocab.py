@@ -10,21 +10,12 @@ class CharVocab:
 
     @classmethod
     def build_from_texts(cls, texts):
-        """Build vocabulary from a list of texts"""
         chars = sorted({c for line in texts for c in line})
         return cls(tokens=chars)
     
     @classmethod
     def build_from_file(cls, file_path, src_col='src', tgt_col='trg', is_csv=True):
-        """
-        Build vocabulary from a data file (CSV or TSV)
-        
-        Args:
-            file_path (str): Path to the data file
-            src_col (str): Name of the source column (for CSV)
-            tgt_col (str): Name of the target column (for CSV)
-            is_csv (bool): Whether the file is CSV (True) or TSV (False)
-        """
+
         if is_csv:
             import pandas as pd
             df = pd.read_csv(file_path, header=None, names=[src_col, tgt_col])
@@ -85,7 +76,6 @@ class CharVocab:
         return [self.decode(seq, strip_specials=strip_specials) for seq in batch_idxs]
     
     def get_stats(self):
-        """Get vocabulary statistics"""
         return {
             'size': len(self.idx2char),
             'num_specials': len(self.specials),
